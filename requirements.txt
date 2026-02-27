@@ -1,0 +1,54 @@
+# ============================================================
+# Pai Kane Group — Python Dependencies
+# ============================================================
+
+# Web Framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+#psycopg[binary]
+alembic==1.14.1
+
+# Task Queue
+celery[redis]==5.4.0
+redis==5.2.1
+
+# LLM
+openai==1.58.1
+
+# Zoho Integration
+httpx==0.28.1
+
+# WhatsApp / Email
+sendgrid==6.11.0
+
+# Web Scraping
+beautifulsoup4==4.12.3
+lxml==5.3.0
+feedparser==6.0.11
+
+# PDF Parsing
+pdfplumber==0.11.4
+
+# Contact Enrichment
+# Apollo.io uses httpx (already included)
+
+# Commodity Data
+# Uses httpx (already included)
+
+# Utilities
+python-dotenv==1.0.1
+python-dateutil==2.9.0
+tenacity==9.0.0
+structlog==24.4.0
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0

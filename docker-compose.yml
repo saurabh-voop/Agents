@@ -1,0 +1,92 @@
+# ============================================================
+# Pai Kane Group — Agentic AI Sales System
+# Docker Compose: PostgreSQL + Redis + FastAPI
+# ============================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: paikane-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-paikane_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-LocalDev2026Secure}
+      POSTGRES_DB: ${POSTGRES_DB:-paikane_agents}
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-paikane_admin} -d ${POSTGRES_DB:-paikane_agents}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - paikane-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: paikane-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - paikane-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paikane-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-paikane_admin}:${POSTGRES_PASSWORD:-LocalDev2026Secure}@postgres:5432/${POSTGRES_DB:-paikane_agents}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-paikane_admin}:${POSTGRES_PASSWORD:-LocalDev2026Secure}@postgres:5432/${POSTGRES_DB:-paikane_agents}
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - paikane-net
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paikane-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-paikane_admin}:${POSTGRES_PASSWORD:-LocalDev2026Secure}@postgres:5432/${POSTGRES_DB:-paikane_agents}
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-paikane_admin}:${POSTGRES_PASSWORD:-LocalDev2026Secure}@postgres:5432/${POSTGRES_DB:-paikane_agents}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - .:/app
+    command: celery -A core.scheduler worker --beat --loglevel=info --concurrency=4
+    networks:
+      - paikane-net
+
+networks:
+  paikane-net:
+    driver: bridge

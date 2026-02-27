@@ -1,0 +1,15 @@
+.env
+*.pem
+*.key
+__pycache__/
+*.pyc
+.pytest_cache/
+postgres-data/
+redis-data/
+*.log
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+.DS_Store
+Thumbs.db

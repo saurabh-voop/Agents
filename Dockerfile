@@ -1,6 +1,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
+ENV PYTHONPATH=/app
 
 # System dependencies for PDF parsing and web scraping
 RUN apt-get update && apt-get install -y --no-install-recommends \

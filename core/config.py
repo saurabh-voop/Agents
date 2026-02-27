@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     agent_s_sector: str = "construction"
     agent_s_location_filter: str = "Mumbai Suburban"
 
+    # --- Commodity Fallback Defaults (used when DB has no data yet) ---
+    hsd_price_fallback_inr: float = 90.0     # HSD per litre — update in .env if price changes
+    usd_inr_baseline: float = 83.5           # USD/INR at time of last price list revision
+
     # --- Notification Emails ---
     gm_email: str = "saurabh.salunkhe@paikane.com"
     engineering_email: str = "engineering@paikane.com"

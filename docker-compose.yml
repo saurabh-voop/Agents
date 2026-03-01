@@ -87,6 +87,15 @@ services:
     networks:
       - paikane-net
 
+  adminer:
+    image: adminer:latest
+    container_name: paikane-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    networks:
+      - paikane-net
+
 networks:
   paikane-net:
     driver: bridge

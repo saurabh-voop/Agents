@@ -283,6 +283,9 @@ Requirement: {lead.get('requirement_text', 'None')}"""
                         "Lead_Source": lead.get("source", ""),
                         "Description": lead.get("requirement_text", ""),
                         "Lead_Status": "Qualified",
+                        "Pai_Kane_Score": lead.get("lead_score", 0),
+                        "Lead_Temperature": lead.get("temperature", "Cold").capitalize(),
+                        "DG_kVA_Requirement": lead.get("estimated_kva") or None,
                     })
                 except Exception as ze:
                     logger.warning("zoho_sync_failed", error=str(ze))
@@ -353,6 +356,17 @@ Estimated kVA: {lead.get('estimated_kva', 'Unknown')}"""
                     conn.commit()
             except Exception as e:
                 logger.error("whatsapp_send_failed", phone=phone, error=str(e))
+
+            # Mark lead as Contacted in Zoho so agent doesn't re-contact next cycle
+            zoho_id = lead.get("zoho_lead_id")
+            if zoho_id:
+                try:
+                    zoho_update_lead(zoho_id, {
+                        "Lead_Status": "Contacted",
+                        "Last_Outreach_Date": datetime.utcnow().strftime("%Y-%m-%d"),
+                    })
+                except Exception:
+                    pass
 
             log_activity(
                 agent=self.agent_id, action="outreach_sent",
@@ -554,18 +568,26 @@ Under 80 words. No emojis. Professional."""
     # Zoho CRM inbound lead processing
     # ============================================================
 
+    # Statuses that mean the lead has already been handled — agent must not re-contact
+    _SKIP_STATUSES = {"Contacted", "Qualified", "Escalated", "Quote Sent", "Won", "Lost", "Do Not Contact", "Converted"}
+
     def process_zoho_inbound(self) -> dict:
         """Check for new leads in Zoho CRM and process them."""
-        results = {"found": 0, "processed": 0}
+        results = {"found": 0, "skipped_status": 0, "processed": 0}
         try:
-            new_leads = search_leads(
-                f"((Lead_Status:equals:New)and(State:equals:Maharashtra))"
-            )
+            new_leads = search_leads("(State:equals:Maharashtra)")
             results["found"] = len(new_leads)
 
             for lead in new_leads:
+                # Skip leads already handled (Contacted, Qualified, Won, Lost, etc.)
+                zoho_status = lead.get("Lead_Status")
+                if zoho_status and zoho_status in self._SKIP_STATUSES:
+                    results["skipped_status"] += 1
+                    continue
+
                 lead_data = {
                     "source": "zoho_inbound",
+                    "zoho_lead_id": lead.get("id", ""),
                     "company_name": lead.get("Company", ""),
                     "contact_name": f"{lead.get('First_Name', '')} {lead.get('Last_Name', '')}".strip(),
                     "phone": lead.get("Phone") or lead.get("Mobile") or "",
@@ -582,12 +604,19 @@ Under 80 words. No emojis. Professional."""
                     lead_data.update(qualified)
                     lead_id = self._save_lead(lead_data)
 
+                    outreach_sent = False
                     if lead_data.get("phone") and lead_data.get("lead_score", 0) >= 40:
                         self._send_outreach(lead_data, lead_id)
+                        outreach_sent = True
 
-                    # Update Zoho lead status
+                    # Write score/temperature back to Zoho and mark as Contacted
                     try:
-                        zoho_update_lead(lead["id"], {"Lead_Status": "Qualified"})
+                        zoho_update_lead(lead["id"], {
+                            "Lead_Status": "Contacted" if outreach_sent else "Qualified",
+                            "Pai_Kane_Score": lead_data.get("lead_score", 0),
+                            "Lead_Temperature": lead_data.get("temperature", "Cold").capitalize(),
+                            "DG_kVA_Requirement": lead_data.get("estimated_kva") or None,
+                        })
                     except Exception:
                         pass
 

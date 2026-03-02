@@ -29,7 +29,7 @@ from core.escalation import create_escalation
 from core.audit import log_activity
 from core.memory import save_memory, build_memory_prompt
 from database.connection import get_sync_engine
-from tools.scraper import fetch_google_news, fetch_maharera_projects
+from tools.scraper import fetch_google_news, fetch_maharera_projects, find_developer_contact, MUMBAI_DISTRICTS
 from tools.search import search_construction_projects
 from tools.enrichment import enrich_contact
 from tools.zoho_crm import search_leads, create_lead as zoho_create_lead, update_lead as zoho_update_lead, search_leads_by_company
@@ -83,8 +83,8 @@ class AgentS:
             news_leads = self._extract_leads_from_news(news_articles)
             raw_leads.extend(news_leads)
 
-        # Source 2: MahaRERA
-        rera_projects = fetch_maharera_projects(district=self.location_filter)
+        # Source 2: MahaRERA — all 4 Greater Mumbai districts, Jan 2024 to today
+        rera_projects = fetch_maharera_projects(districts=[self.location_filter])
         if rera_projects:
             rera_leads = self._extract_leads_from_rera(rera_projects)
             raw_leads.extend(rera_leads)
@@ -103,8 +103,12 @@ class AgentS:
                 continue
 
             # F2: ENRICH (if no contact details)
+            # RERA leads → try free website/JustDial scrape first, then Apollo
             if not lead.get("phone") and not lead.get("email"):
-                contact = enrich_contact(lead.get("company_name", ""))
+                contact = enrich_contact(
+                    company_name=lead.get("company_name", ""),
+                    location=lead.get("location", self.location_filter),
+                )
                 if contact and not contact.get("error"):
                     lead["contact_name"] = contact.get("name", "")
                     lead["phone"] = contact.get("phone", "")
@@ -159,14 +163,22 @@ Return a JSON array. If no relevant leads, return []."""
         """Convert RERA project data into lead format."""
         leads = []
         for p in projects:
+            developer = p.get("developer", "").strip()
+            if not developer:
+                continue
+            registered_on = p.get("registered_on", "")
+            date_note = f" Registered on RERA: {registered_on}." if registered_on else ""
             leads.append({
                 "source": "rera",
-                "company_name": p.get("developer", ""),
+                "company_name": developer,
                 "project_name": p.get("project_name", ""),
                 "rera_number": p.get("rera_number", ""),
-                "location": p.get("location", self.location_filter),
+                "location": p.get("district", p.get("location", self.location_filter)),
                 "project_type": p.get("type", "residential"),
-                "requirement_text": f"RERA registered project: {p.get('project_name', '')} by {p.get('developer', '')}. Under construction in {p.get('location', '')}.",
+                "requirement_text": (
+                    f"RERA registered project: {p.get('project_name', '')} "
+                    f"by {developer}. Under construction in {p.get('district', p.get('location', ''))}.{date_note}"
+                ),
             })
         return leads
 
@@ -272,24 +284,35 @@ Requirement: {lead.get('requirement_text', 'None')}"""
                 row = result.fetchone()
                 lead_id = str(row[0]) if row else None
 
-                # Also create in Zoho CRM (async — don't block on failure)
-                try:
-                    zoho_create_lead({
-                        "Company": lead.get("company_name", ""),
-                        "Last_Name": lead.get("contact_name", "Unknown"),
-                        "Phone": lead.get("phone", ""),
-                        "Email": lead.get("email", ""),
-                        "City": lead.get("location", ""),
-                        "State": "Maharashtra",
-                        "Lead_Source": lead.get("source", ""),
-                        "Description": lead.get("requirement_text", ""),
-                        "Lead_Status": "Qualified",
-                        "Pai_Kane_Score": lead.get("lead_score", 0),
-                        "Lead_Temperature": lead.get("temperature", "Cold").capitalize(),
-                        "DG_kVA_Requirement": lead.get("estimated_kva") or None,
-                    })
-                except Exception as ze:
-                    logger.warning("zoho_sync_failed", error=str(ze))
+                # Also create in Zoho CRM — only if we have real contact info
+                # Leads without phone/email stay in local DB as needs_enrichment
+                _LEAD_SOURCE_MAP = {
+                    "rera": "RERA",
+                    "news": "News",
+                    "zoho_inbound": "Zoho Inbound",
+                }
+                has_real_phone = lead.get("phone", "") not in ("", "8888888888")
+                has_email = bool(lead.get("email", ""))
+                if has_real_phone or has_email:
+                    try:
+                        zoho_create_lead({
+                            "Company": lead.get("company_name", ""),
+                            "Last_Name": lead.get("contact_name") or lead.get("company_name", "Unknown"),
+                            "Phone": lead.get("phone", ""),
+                            "Email": lead.get("email", ""),
+                            "City": lead.get("location", ""),
+                            "State": "Maharashtra",
+                            "Country": "India",
+                            "Industry": "Construction",
+                            "Lead_Source": _LEAD_SOURCE_MAP.get(lead.get("source", ""), lead.get("source", "")),
+                            "Description": lead.get("requirement_text", ""),
+                            "Lead_Status": "Qualified",
+                            "Pai_Kane_Score": lead.get("lead_score", 0),
+                            "Lead_Temperature": lead.get("temperature", "Cold").capitalize(),
+                            "DG_kVA_Requirement": lead.get("estimated_kva") or None,
+                        })
+                    except Exception as ze:
+                        logger.warning("zoho_sync_failed", error=str(ze))
 
                 log_activity(
                     agent=self.agent_id, action="lead_created",
@@ -311,10 +334,10 @@ Requirement: {lead.get('requirement_text', 'None')}"""
     # ============================================================
 
     def _send_outreach(self, lead: dict, lead_id: str | None) -> None:
-        """Generate personalized outreach and send via WhatsApp."""
+        """Generate personalized outreach and send via WhatsApp + Email if available."""
         prompt = """Generate a personalized WhatsApp outreach message for this construction lead.
-Rules: Under 150 words. Professional but warm. Reference their project. 
-Highlight 1-2 advantages (CPCB IV+ compliant, 2-3 week delivery for 25-160 kVA, 
+Rules: Under 150 words. Professional but warm. Reference their project.
+Highlight 1-2 advantages (CPCB IV+ compliant, 2-3 week delivery for 25-160 kVA,
 15000 sets/year capacity, ex-works Goa pricing).
 Ask ONE discovery question. Sign off as Pai Kane Group.
 NEVER mention price in INR. NEVER use emojis. Format for WhatsApp."""
@@ -384,6 +407,40 @@ Estimated kVA: {lead.get('estimated_kva', 'Unknown')}"""
                 lead_id=lead_id, conversation_id=conv_id,
                 details={"channel": "whatsapp", "message_length": len(message)},
             )
+
+        # Also send email if available (in addition to WhatsApp)
+        email = lead.get("email", "")
+        if email:
+            email_prompt = """Generate a formal first-contact email for this construction lead.
+Format: Subject line on first line, blank line, then email body.
+Rules: Under 200 words. Professional tone. Reference their project by name.
+Highlight 1-2 advantages (CPCB IV+ compliant, 2-3 week delivery for 25-160 kVA,
+15000 sets/year capacity, manufactured in Goa).
+End with a clear call to action (schedule a call or reply to discuss requirements).
+Sign off with full name placeholder and Pai Kane Group, Goa.
+NEVER mention price. No emojis."""
+
+            email_content = call_llm_simple(email_prompt, lead_context, temperature=0.7, max_tokens=400)
+            if email_content and "\n" in email_content:
+                subject_line, _, body = email_content.partition("\n")
+                subject = subject_line.replace("Subject:", "").strip()
+                try:
+                    send_email(
+                        to_email=email,
+                        to_name=lead.get("contact_name") or lead.get("company_name", ""),
+                        subject=subject,
+                        body=body.strip(),
+                    )
+                    log_activity(
+                        agent=self.agent_id, action="outreach_sent",
+                        lead_id=lead_id,
+                        details={"channel": "email", "to": email},
+                    )
+                    save_memory(lead.get("company_name", ""), self.agent_id, {
+                        "email_outreach_sent": datetime.utcnow().strftime("%Y-%m-%d"),
+                    })
+                except Exception as e:
+                    logger.error("email_send_failed", email=email, error=str(e))
 
     # ============================================================
     # F7: RESPOND — Handle incoming customer replies

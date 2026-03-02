@@ -1,6 +1,12 @@
 """
 Contact enrichment tool — finds decision-maker contacts for companies.
-Uses Apollo.io API. Critical for news/RERA leads that have company names but no contacts.
+
+Priority order (free first, paid fallback):
+  1. Website scrape via Google search + contact page (free)
+  2. JustDial scrape (free)
+  3. Apollo.io API (paid — only used if API key is configured)
+
+Critical for news/RERA leads that have company names but no contacts.
 """
 
 import httpx
@@ -12,7 +18,6 @@ logger = structlog.get_logger()
 settings = get_settings()
 
 
-@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=5))
 def enrich_contact(
     company_name: str,
     target_titles: list[str] | None = None,
@@ -20,20 +25,47 @@ def enrich_contact(
 ) -> dict:
     """
     Find the right person to contact at a company.
-    
-    Args:
-        company_name: The company to search
-        target_titles: Job titles to prioritize (default: procurement/projects roles)
-        location: Company location for filtering
-    
+
+    Tries free methods first (website scrape, JustDial),
+    falls back to Apollo.io only if API key is configured.
+
     Returns:
-        {"name", "title", "email", "phone", "linkedin_url", "confidence"}
+        {"name", "title", "email", "phone", "source", "confidence"}
         or {"error": "..."} if not found
     """
-    if not settings.apollo_api_key:
-        logger.warning("apollo_api_key_not_set")
-        return {"error": "Apollo.io API key not configured"}
+    # Step 1: Free — scrape developer website + JustDial
+    from tools.scraper import find_developer_contact
+    free_result = find_developer_contact(company_name, location.split(",")[0])
 
+    if free_result.get("phone") or free_result.get("email"):
+        return {
+            "name": "",          # website scrape rarely gives a name
+            "title": "",
+            "email": free_result.get("email", ""),
+            "phone": free_result.get("phone", ""),
+            "website": free_result.get("website", ""),
+            "source": free_result.get("source", "website"),
+            "confidence": "high" if free_result.get("phone") else "medium",
+        }
+
+    # Step 2: Apollo.io (paid fallback — only if key is set)
+    if settings.apollo_api_key:
+        apollo_result = _enrich_via_apollo(company_name, target_titles, location)
+        if not apollo_result.get("error"):
+            apollo_result["source"] = "apollo"
+            return apollo_result
+        logger.info("apollo_fallback_failed", company=company_name, error=apollo_result.get("error"))
+
+    return {"error": f"No contact found for: {company_name}"}
+
+
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=5))
+def _enrich_via_apollo(
+    company_name: str,
+    target_titles: list[str] | None = None,
+    location: str = "Mumbai, India",
+) -> dict:
+    """Apollo.io enrichment — paid fallback."""
     if target_titles is None:
         # DG set buyer personas in construction companies
         target_titles = [
@@ -57,7 +89,6 @@ def enrich_contact(
         orgs = response.json().get("organizations", [])
 
         if not orgs:
-            logger.info("apollo_org_not_found", company=company_name)
             return {"error": f"Organization not found: {company_name}"}
 
         org_id = orgs[0].get("id")
@@ -76,12 +107,10 @@ def enrich_contact(
         people = response.json().get("people", [])
 
         if not people:
-            logger.info("apollo_no_contacts", company=company_name)
             return {"error": f"No matching contacts found at {company_name}"}
 
-        # Return the best match (first result, highest relevance)
         person = people[0]
-        result = {
+        return {
             "name": person.get("name", ""),
             "title": person.get("title", ""),
             "email": person.get("email", ""),
@@ -90,9 +119,6 @@ def enrich_contact(
             "company": company_name,
             "confidence": "high" if person.get("email") else "medium",
         }
-
-        logger.info("apollo_contact_found", company=company_name, name=result["name"])
-        return result
 
     except Exception as e:
         logger.error("apollo_enrichment_failed", company=company_name, error=str(e))
@@ -103,13 +129,10 @@ def _extract_phone(person: dict) -> str:
     """Extract phone number from Apollo person data."""
     phones = person.get("phone_numbers", [])
     if phones:
-        # Prefer mobile numbers
         for p in phones:
             if p.get("type") == "mobile":
                 return p.get("number", "")
         return phones[0].get("number", "")
-
-    # Fallback to organization phone
     org = person.get("organization", {})
     return org.get("phone", "")
 

@@ -15,10 +15,20 @@ class Settings(BaseSettings):
     # --- Redis ---
     redis_url: str = "redis://localhost:6379/0"
 
-    # --- OpenAI ---
+    # --- LLM Provider ---
+    # Set LLM_PROVIDER=groq for free trial, LLM_PROVIDER=openai for production
+    llm_provider: str = "groq"
+
+    # --- OpenAI (production) ---
     openai_api_key: str = ""
     openai_model_default: str = "gpt-4o-mini"
     openai_model_advanced: str = "gpt-4o"
+
+    # --- Groq (free trial — same OpenAI SDK format, just different URL + key) ---
+    groq_api_key: str = ""
+    groq_api_base: str = "https://api.groq.com/openai/v1"
+    groq_model_default: str = "llama-3.3-70b-versatile"
+    groq_model_advanced: str = "llama-3.3-70b-versatile"
 
     # --- Zoho CRM ---
     zoho_client_id: str = ""

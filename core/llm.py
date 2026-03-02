@@ -17,8 +17,28 @@ from core.config import get_settings
 logger = structlog.get_logger()
 settings = get_settings()
 
-# Initialize OpenAI client once
-client = OpenAI(api_key=settings.openai_api_key)
+# ── LLM Client ────────────────────────────────────────────────────────────────
+# Switch providers via LLM_PROVIDER in .env — no code changes needed.
+# Groq is 100% OpenAI-SDK compatible: same tool calling, same response format,
+# same agent loop. Only the base_url and model names differ.
+#
+# To use Groq (free trial):   LLM_PROVIDER=groq   GROQ_API_KEY=gsk_...
+# To use OpenAI (production): LLM_PROVIDER=openai  OPENAI_API_KEY=sk-...
+
+if settings.llm_provider == "groq":
+    # Groq — free tier, OpenAI-compatible, Llama 3.3 70B
+    client = OpenAI(
+        api_key=settings.groq_api_key,
+        base_url=settings.groq_api_base,
+    )
+    _model_default = settings.groq_model_default
+    _model_advanced = settings.groq_model_advanced
+else:
+    # OpenAI — production
+    # client = OpenAI(api_key=settings.openai_api_key)
+    client = OpenAI(api_key=settings.openai_api_key)
+    _model_default = settings.openai_model_default
+    _model_advanced = settings.openai_model_advanced
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -36,7 +56,7 @@ def call_llm(
     - response.choices[0].message.content (text response)
     - response.choices[0].message.tool_calls (if tools were used)
     """
-    model = model or settings.openai_model_default
+    model = model or _model_default
     start_time = time.time()
 
     kwargs = {

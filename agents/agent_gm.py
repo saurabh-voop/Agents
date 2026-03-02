@@ -25,6 +25,7 @@ from core.config import get_settings
 from core.llm import run_agent_loop
 from core.escalation import pick_up_escalation, complete_escalation
 from core.audit import log_activity
+from core.memory import save_memory, build_memory_prompt
 from database.connection import get_sync_engine
 from tools.calculator import calculate_margin, calculate_gst, calculate_deal_value, estimate_freight
 from tools.commodity import get_commodity_snapshot
@@ -338,8 +339,11 @@ Return a JSON recommendation with these exact keys:
 
         tool_handlers = _make_tool_handlers()
 
+        # Inject memory about this company into system prompt
+        system_prompt = AGENT_GM_SYSTEM_PROMPT + build_memory_prompt(company_name, self.agent_id)
+
         result = run_agent_loop(
-            system_prompt=AGENT_GM_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             user_message=user_message,
             tools_spec=AGENT_GM_TOOLS_SPEC,
             tool_handlers=tool_handlers,
@@ -355,6 +359,19 @@ Return a JSON recommendation with these exact keys:
                     response_text = response_text[4:]
             recommendation = json.loads(response_text.strip())
             recommendation["_tool_calls"] = len(result.get("tool_calls", []))
+
+            # Save key commercial facts to memory
+            pricing = recommendation.get("pricing", {})
+            save_memory(company_name, self.agent_id, {
+                "last_deal_date": datetime.utcnow().strftime("%Y-%m-%d"),
+                "last_recommended_price": pricing.get("recommended_price"),
+                "last_margin_pct": pricing.get("margin_above_pep_pct"),
+                "last_payment_terms": recommendation.get("payment_terms"),
+                "last_recommendation": recommendation.get("recommendation"),
+                "risk_level": recommendation.get("risk_level"),
+                "existing_customer": recommendation.get("existing_customer"),
+            })
+
             return recommendation
         except (json.JSONDecodeError, Exception) as e:
             logger.warning("gm_recommendation_parse_failed", error=str(e))

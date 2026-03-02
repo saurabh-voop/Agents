@@ -622,10 +622,26 @@ CREATE TRIGGER tr_deals_updated BEFORE UPDATE ON deal_recommendations FOR EACH R
 CREATE TRIGGER tr_products_updated BEFORE UPDATE ON products FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 CREATE TRIGGER tr_templates_updated BEFORE UPDATE ON outreach_templates FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
+-- ------------------------------------------------------------
+-- Table: agent_memory
+-- Persistent per-company facts across agent sessions.
+-- Injected into system prompt before each run_agent_loop call.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS agent_memory (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_id   VARCHAR(255) NOT NULL,   -- company_name or lead_id (lowercased)
+    agent       VARCHAR(50)  NOT NULL,   -- agent_s, agent_rm, agent_gm
+    facts       JSONB        NOT NULL DEFAULT '{}',
+    updated_at  TIMESTAMPTZ  DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_memory_unique ON agent_memory(entity_id, agent);
+CREATE INDEX idx_agent_memory_agent ON agent_memory(agent);
+CREATE TRIGGER tr_agent_memory_updated BEFORE UPDATE ON agent_memory FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
 -- ============================================================
 -- DONE
 -- ============================================================
--- Total tables: 10
+-- Total tables: 11
 -- Total product records seeded: ~53 (covering all AMF Logic + key AMF ATS configs)
 -- Total template records seeded: 4 (construction segment for pilot)
 -- ============================================================

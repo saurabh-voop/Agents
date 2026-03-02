@@ -7,6 +7,7 @@ Agents define their tools, this module executes the LLM calls.
 import json
 import time
 import structlog
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from typing import Callable
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -128,35 +129,36 @@ def run_agent_loop(
                 "iterations": iteration,
             }
 
-        # Agent wants to call tools — execute each one
-        # Add assistant message with tool calls to conversation
+        # Agent wants to call tools — execute all in parallel then feed results back
         messages.append(message.model_dump())
 
-        for tool_call in message.tool_calls:
+        def _run_tool(tool_call):
             fn_name = tool_call.function.name
             fn_args = json.loads(tool_call.function.arguments)
-
             logger.info("tool_call", tool=fn_name, args=fn_args)
-
-            # Execute the tool
             handler = tool_handlers.get(fn_name)
-            if handler:
-                try:
+            try:
+                if handler:
                     tool_result = handler(**fn_args)
                     result_str = json.dumps(tool_result) if isinstance(tool_result, (dict, list)) else str(tool_result)
-                except Exception as e:
-                    logger.error("tool_error", tool=fn_name, error=str(e))
-                    result_str = json.dumps({"error": str(e)})
-            else:
-                result_str = json.dumps({"error": f"Unknown tool: {fn_name}"})
+                else:
+                    result_str = json.dumps({"error": f"Unknown tool: {fn_name}"})
+            except Exception as e:
+                logger.error("tool_error", tool=fn_name, error=str(e))
+                result_str = json.dumps({"error": str(e)})
+            return tool_call, fn_name, fn_args, result_str
 
-            all_tool_calls.append({
-                "tool": fn_name,
-                "args": fn_args,
-                "result": result_str,
-            })
+        # Run all tool calls in parallel (OpenAI supports multiple tool_calls per response)
+        with ThreadPoolExecutor(max_workers=len(message.tool_calls)) as executor:
+            futures = [executor.submit(_run_tool, tc) for tc in message.tool_calls]
+            parallel_results = [f.result() for f in as_completed(futures)]
 
-            # Feed tool result back to LLM
+        # Sort results back to original tool_call order (OpenAI requires matching order)
+        tc_order = {tc.id: i for i, tc in enumerate(message.tool_calls)}
+        parallel_results.sort(key=lambda r: tc_order.get(r[0].id, 0))
+
+        for tool_call, fn_name, fn_args, result_str in parallel_results:
+            all_tool_calls.append({"tool": fn_name, "args": fn_args, "result": result_str})
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,

@@ -27,6 +27,7 @@ from core.conversation import (
 )
 from core.escalation import create_escalation
 from core.audit import log_activity
+from core.memory import save_memory, build_memory_prompt
 from database.connection import get_sync_engine
 from tools.scraper import fetch_google_news, fetch_maharera_projects
 from tools.search import search_construction_projects
@@ -367,6 +368,16 @@ Estimated kVA: {lead.get('estimated_kva', 'Unknown')}"""
                     })
                 except Exception:
                     pass
+
+            # Save outreach fact to memory
+            save_memory(lead.get("company_name", ""), self.agent_id, {
+                "last_outreach_date": datetime.utcnow().strftime("%Y-%m-%d"),
+                "outreach_channel": "whatsapp",
+                "lead_score": lead.get("lead_score"),
+                "temperature": lead.get("temperature"),
+                "estimated_kva": lead.get("estimated_kva"),
+                "segment": lead.get("segment"),
+            })
 
             log_activity(
                 agent=self.agent_id, action="outreach_sent",

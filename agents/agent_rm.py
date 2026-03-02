@@ -16,10 +16,12 @@ Functions:
 
 import json
 import structlog
+from datetime import datetime
 from sqlalchemy import text
 
 from core.config import get_settings
 from core.llm import call_llm_json, run_agent_loop
+from core.memory import get_memory, save_memory, build_memory_prompt
 from core.conversation import get_conversation_history, add_message, update_current_agent, format_history_for_llm
 from core.escalation import pick_up_escalation, complete_escalation, create_escalation
 from core.audit import log_activity
@@ -340,8 +342,11 @@ Return a JSON configuration object as your final response."""
 
         tool_handlers = _make_tool_handlers(self.engine)
 
+        # Inject memory about this company into system prompt
+        system_prompt = AGENT_RM_SYSTEM_PROMPT + build_memory_prompt(company, self.agent_id)
+
         result = run_agent_loop(
-            system_prompt=AGENT_RM_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             user_message=user_message,
             tools_spec=AGENT_RM_TOOLS_SPEC,
             tool_handlers=tool_handlers,
@@ -360,6 +365,17 @@ Return a JSON configuration object as your final response."""
             config = json.loads(response_text.strip())
             config["_tool_calls"] = len(result.get("tool_calls", []))
             config["_iterations"] = result.get("iterations", 0)
+
+            # Save key facts to memory for future runs
+            save_memory(company, self.agent_id, {
+                "last_config_date": datetime.utcnow().strftime("%Y-%m-%d"),
+                "last_kva": config.get("kva_rating"),
+                "last_engine": config.get("engine_make"),
+                "last_enclosure": config.get("enclosure_type"),
+                "is_standard": config.get("is_standard", True),
+                "segment": config.get("segment"),
+            })
+
             return config
         except (json.JSONDecodeError, Exception) as e:
             logger.warning("rm_config_parse_failed", error=str(e))

@@ -16,7 +16,7 @@ F10: LOG — Audit trail of every action
 
 import json
 import structlog
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
 
 from core.config import get_settings
@@ -38,6 +38,12 @@ from tools.email_tool import send_email
 
 logger = structlog.get_logger()
 settings = get_settings()
+
+
+def _clean_zoho_name(first, last) -> str:
+    """Zoho sometimes sends the string 'None' for blank fields — strip those out."""
+    parts = [p for p in (first, last) if p and str(p).strip().lower() != "none"]
+    return " ".join(str(p).strip() for p in parts)
 
 
 def _load_agent_config(config_path: str) -> dict:
@@ -70,7 +76,7 @@ class AgentS:
     def run_mining_cycle(self) -> dict:
         """Full mining cycle: News + RERA + web search → qualify → enrich → store → outreach."""
         logger.info("mining_cycle_started", agent=self.agent_id)
-        start = datetime.utcnow()
+        start = datetime.now(timezone.utc)
 
         # Collect raw signals from all sources in parallel concept (sequential here)
         raw_leads = []
@@ -128,7 +134,7 @@ class AgentS:
                 self._send_outreach(lead, lead_id)
                 results["outreach_sent"] += 1
 
-        elapsed_ms = int((datetime.utcnow() - start).total_seconds() * 1000)
+        elapsed_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
         log_activity(
             agent=self.agent_id, action="mining_cycle_completed",
             details=results, processing_time_ms=elapsed_ms,
@@ -232,13 +238,21 @@ Requirement: {lead.get('requirement_text', 'None')}"""
             return False
 
         query = text("""
-            SELECT COUNT(*) FROM leads 
-            WHERE LOWER(company_name) = LOWER(:company) 
+            SELECT COUNT(*) FROM leads
+            WHERE LOWER(company_name) = LOWER(:company)
             AND deleted_at IS NULL
         """)
         with self.engine.connect() as conn:
             count = conn.execute(query, {"company": company_name}).scalar()
         return count > 0
+
+    def _is_duplicate_by_phone(self, phone: str) -> bool:
+        """Fallback dedup: check if this phone already exists (used when company name is empty)."""
+        if not phone or phone == "8888888888":
+            return False
+        query = text("SELECT COUNT(*) FROM leads WHERE phone = :phone AND deleted_at IS NULL")
+        with self.engine.connect() as conn:
+            return conn.execute(query, {"phone": phone}).scalar() > 0
 
     # ============================================================
     # F4: WRITE CRM — Save to PostgreSQL + Zoho
@@ -294,25 +308,29 @@ Requirement: {lead.get('requirement_text', 'None')}"""
                 has_real_phone = lead.get("phone", "") not in ("", "8888888888")
                 has_email = bool(lead.get("email", ""))
                 if has_real_phone or has_email:
-                    try:
-                        zoho_create_lead({
-                            "Company": lead.get("company_name", ""),
-                            "Last_Name": lead.get("contact_name") or lead.get("company_name", "Unknown"),
-                            "Phone": lead.get("phone", ""),
-                            "Email": lead.get("email", ""),
-                            "City": lead.get("location", ""),
-                            "State": "Maharashtra",
-                            "Country": "India",
-                            "Industry": "Construction",
-                            "Lead_Source": _LEAD_SOURCE_MAP.get(lead.get("source", ""), lead.get("source", "")),
-                            "Description": lead.get("requirement_text", ""),
-                            "Lead_Status": "Qualified",
-                            "Pai_Kane_Score": lead.get("lead_score", 0),
-                            "Lead_Temperature": lead.get("temperature", "Cold").capitalize(),
-                            "DG_kVA_Requirement": lead.get("estimated_kva") or None,
-                        })
-                    except Exception as ze:
-                        logger.warning("zoho_sync_failed", error=str(ze))
+                    zoho_payload = {
+                        "Company": lead.get("company_name", ""),
+                        "Last_Name": lead.get("contact_name") or lead.get("company_name", "Unknown"),
+                        "Phone": lead.get("phone", ""),
+                        "Email": lead.get("email", ""),
+                        "City": lead.get("location", ""),
+                        "State": "Maharashtra",
+                        "Country": "India",
+                        "Industry": "Construction",
+                        "Lead_Source": _LEAD_SOURCE_MAP.get(lead.get("source", ""), lead.get("source", "")),
+                        "Description": lead.get("requirement_text", ""),
+                        "Lead_Status": "Qualified",
+                        "Pai_Kane_Score": lead.get("lead_score", 0),
+                        "Lead_Temperature": lead.get("temperature", "Cold").capitalize(),
+                        "DG_kVA_Requirement": lead.get("estimated_kva") or None,
+                    }
+                    if settings.dry_run:
+                        logger.info("DRY_RUN zoho_create_lead skipped", payload=zoho_payload)
+                    else:
+                        try:
+                            zoho_create_lead(zoho_payload)
+                        except Exception as ze:
+                            logger.warning("zoho_sync_failed", error=str(ze))
 
                 log_activity(
                     agent=self.agent_id, action="lead_created",
@@ -367,34 +385,43 @@ Estimated kVA: {lead.get('estimated_kva', 'Unknown')}"""
             )
             add_message(conv_id, self.agent_id, message, delivery_status="queued")
 
-            try:
-                wa_result = send_text_message(phone, message)
-                # Update delivery status
-                with self.engine.connect() as conn:
-                    conn.execute(text("""
-                        UPDATE messages SET delivery_status = 'sent',
-                        channel_message_id = :wa_id
-                        WHERE conversation_id = :conv_id AND delivery_status = 'queued'
-                        ORDER BY created_at DESC LIMIT 1
-                    """), {"wa_id": wa_result.get("message_id"), "conv_id": conv_id})
-                    conn.commit()
-            except Exception as e:
-                logger.error("whatsapp_send_failed", phone=phone, error=str(e))
+            if settings.dry_run:
+                logger.info("DRY_RUN whatsapp_send skipped",
+                            phone=phone, company=lead.get("company_name"),
+                            message_preview=message[:100])
+            else:
+                try:
+                    wa_result = send_text_message(phone, message)
+                    # Update delivery status
+                    with self.engine.connect() as conn:
+                        conn.execute(text("""
+                            UPDATE messages SET delivery_status = 'sent',
+                            channel_message_id = :wa_id
+                            WHERE conversation_id = :conv_id AND delivery_status = 'queued'
+                            ORDER BY created_at DESC LIMIT 1
+                        """), {"wa_id": wa_result.get("message_id"), "conv_id": conv_id})
+                        conn.commit()
+                except Exception as e:
+                    logger.error("whatsapp_send_failed", phone=phone, error=str(e))
 
             # Mark lead as Contacted in Zoho so agent doesn't re-contact next cycle
             zoho_id = lead.get("zoho_lead_id")
             if zoho_id:
-                try:
-                    zoho_update_lead(zoho_id, {
-                        "Lead_Status": "Contacted",
-                        "Last_Outreach_Date": datetime.utcnow().strftime("%Y-%m-%d"),
-                    })
-                except Exception:
-                    pass
+                if settings.dry_run:
+                    logger.info("DRY_RUN zoho_update_lead skipped",
+                                zoho_id=zoho_id, status="Contacted")
+                else:
+                    try:
+                        zoho_update_lead(zoho_id, {
+                            "Lead_Status": "Contacted",
+                            "Last_Outreach_Date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                        })
+                    except Exception:
+                        pass
 
             # Save outreach fact to memory
             save_memory(lead.get("company_name", ""), self.agent_id, {
-                "last_outreach_date": datetime.utcnow().strftime("%Y-%m-%d"),
+                "last_outreach_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                 "outreach_channel": "whatsapp",
                 "lead_score": lead.get("lead_score"),
                 "temperature": lead.get("temperature"),
@@ -424,23 +451,28 @@ NEVER mention price. No emojis."""
             if email_content and "\n" in email_content:
                 subject_line, _, body = email_content.partition("\n")
                 subject = subject_line.replace("Subject:", "").strip()
-                try:
-                    send_email(
-                        to_email=email,
-                        to_name=lead.get("contact_name") or lead.get("company_name", ""),
-                        subject=subject,
-                        body=body.strip(),
-                    )
-                    log_activity(
-                        agent=self.agent_id, action="outreach_sent",
-                        lead_id=lead_id,
-                        details={"channel": "email", "to": email},
-                    )
-                    save_memory(lead.get("company_name", ""), self.agent_id, {
-                        "email_outreach_sent": datetime.utcnow().strftime("%Y-%m-%d"),
-                    })
-                except Exception as e:
-                    logger.error("email_send_failed", email=email, error=str(e))
+                if settings.dry_run:
+                    logger.info("DRY_RUN email_send skipped",
+                                to=email, subject=subject,
+                                body_preview=body.strip()[:150])
+                else:
+                    try:
+                        send_email(
+                            to_email=email,
+                            to_name=lead.get("contact_name") or lead.get("company_name", ""),
+                            subject=subject,
+                            body=body.strip(),
+                        )
+                        log_activity(
+                            agent=self.agent_id, action="outreach_sent",
+                            lead_id=lead_id,
+                            details={"channel": "email", "to": email},
+                        )
+                        save_memory(lead.get("company_name", ""), self.agent_id, {
+                            "email_outreach_sent": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                        })
+                    except Exception as e:
+                        logger.error("email_send_failed", email=email, error=str(e))
 
     # ============================================================
     # F7: RESPOND — Handle incoming customer replies
@@ -566,7 +598,7 @@ Return JSON: {"should_escalate": true/false, "reason": "pricing_request|technica
 
     def process_followups(self) -> dict:
         """Daily follow-up processing for all leads that need follow-up."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         results = {"checked": 0, "sent": 0}
 
         # Find leads needing follow-up
@@ -641,7 +673,7 @@ Under 80 words. No emojis. Professional."""
 
     def process_zoho_inbound(self) -> dict:
         """Check for new leads in Zoho CRM and process them."""
-        results = {"found": 0, "skipped_status": 0, "processed": 0}
+        results = {"found": 0, "skipped_status": 0, "skipped_internal": 0, "skipped_location": 0, "processed": 0}
         try:
             new_leads = search_leads("(State:equals:Maharashtra)")
             results["found"] = len(new_leads)
@@ -653,19 +685,40 @@ Under 80 words. No emojis. Professional."""
                     results["skipped_status"] += 1
                     continue
 
+                # Skip Pai Kane internal employee emails
+                email_raw = lead.get("Email", "")
+                if email_raw and any(
+                    email_raw.lower().endswith(domain)
+                    for domain in ("@paikane.com", "@paikanegroup.com")
+                ):
+                    results["skipped_internal"] += 1
+                    continue
+
+                # Skip leads from outside target location
+                # (only skip if City is explicitly set to a non-Mumbai area)
+                city = (lead.get("City") or "").strip()
+                if city and "mumbai" not in city.lower() and city.lower() != self.location_filter.lower():
+                    results["skipped_location"] += 1
+                    continue
+
                 lead_data = {
                     "source": "zoho_inbound",
                     "zoho_lead_id": lead.get("id", ""),
                     "company_name": lead.get("Company", ""),
-                    "contact_name": f"{lead.get('First_Name', '')} {lead.get('Last_Name', '')}".strip(),
+                    "contact_name": _clean_zoho_name(lead.get("First_Name"), lead.get("Last_Name")),
                     "phone": lead.get("Phone") or lead.get("Mobile") or "",
-                    "email": lead.get("Email", ""),
-                    "location": lead.get("City", self.location_filter),
+                    "email": email_raw,
+                    "location": city or self.location_filter,
                     "requirement_text": lead.get("Description", ""),
                 }
 
-                if self._is_duplicate(lead_data["company_name"]):
+                # Primary dedup by company name
+                if lead_data["company_name"] and self._is_duplicate(lead_data["company_name"]):
                     continue
+                # Fallback dedup by phone when company name is empty
+                if not lead_data["company_name"] and lead_data.get("phone"):
+                    if self._is_duplicate_by_phone(lead_data["phone"]):
+                        continue
 
                 qualified = self._qualify_lead(lead_data)
                 if qualified:
@@ -678,15 +731,20 @@ Under 80 words. No emojis. Professional."""
                         outreach_sent = True
 
                     # Write score/temperature back to Zoho and mark as Contacted
-                    try:
-                        zoho_update_lead(lead["id"], {
-                            "Lead_Status": "Contacted" if outreach_sent else "Qualified",
-                            "Pai_Kane_Score": lead_data.get("lead_score", 0),
-                            "Lead_Temperature": lead_data.get("temperature", "Cold").capitalize(),
-                            "DG_kVA_Requirement": lead_data.get("estimated_kva") or None,
-                        })
-                    except Exception:
-                        pass
+                    zoho_update_payload = {
+                        "Lead_Status": "Contacted" if outreach_sent else "Qualified",
+                        "Pai_Kane_Score": lead_data.get("lead_score", 0),
+                        "Lead_Temperature": lead_data.get("temperature", "Cold").capitalize(),
+                        "DG_kVA_Requirement": lead_data.get("estimated_kva") or None,
+                    }
+                    if settings.dry_run:
+                        logger.info("DRY_RUN zoho_update_lead skipped",
+                                    zoho_id=lead["id"], payload=zoho_update_payload)
+                    else:
+                        try:
+                            zoho_update_lead(lead["id"], zoho_update_payload)
+                        except Exception:
+                            pass
 
                     results["processed"] += 1
 

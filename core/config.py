@@ -84,6 +84,11 @@ class Settings(BaseSettings):
     # --- Logging ---
     log_level: str = "INFO"
 
+    # --- Dry Run (testing) ---
+    # Set DRY_RUN=true to log all CRM/WhatsApp/Email writes without actually sending anything.
+    # Flip to false when ready to go live.
+    dry_run: bool = False
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

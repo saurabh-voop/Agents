@@ -81,9 +81,9 @@ class AgentS:
         # Collect raw signals from all sources in parallel concept (sequential here)
         raw_leads = []
 
-        # Source 1: Google News RSS — use "Mumbai" not the district name (RSS works on city, not suburb)
+        # Source 1: Google News RSS — broad real estate query gets 30 articles vs DG-specific gets 0
         news_articles = fetch_google_news(
-            query="construction project Mumbai OR DG set OR diesel generator OR power backup Mumbai"
+            query="Mumbai real estate construction project builder developer"
         )
         if news_articles:
             news_leads = self._extract_leads_from_news(news_articles)
@@ -144,9 +144,10 @@ class AgentS:
 
     def _extract_leads_from_news(self, articles: list[dict]) -> list[dict]:
         """Use LLM to extract structured lead data from news articles."""
+        # Limit to 10 articles, truncate summaries — Groq free tier has tight token limits
         articles_text = "\n\n".join([
-            f"Title: {a['title']}\nSource: {a['source']}\nSummary: {a.get('summary', '')}\nLink: {a['link']}"
-            for a in articles[:20]
+            f"Title: {a['title']}\nSource: {a['source']}\nSummary: {a.get('summary', '')[:200]}"
+            for a in articles[:10]
         ])
 
         prompt = """Extract potential DG set leads from these news articles about Mumbai construction.

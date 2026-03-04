@@ -7,12 +7,15 @@ portal. Filters by district and registration date to get active 2024-2026 projec
 """
 
 import re
+import json
 import httpx
 import feedparser
 import structlog
 from datetime import datetime
+from urllib.parse import unquote
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_fixed
+from core.config import get_settings
 
 logger = structlog.get_logger()
 
@@ -250,72 +253,121 @@ def find_developer_contact(
     """
     Find phone/email for a developer using Google search + website scraping.
     Tries 3 sources in order:
-      1. Google search → developer's own website
-      2. JustDial listing
-      3. IndiaMART listing
+      1. DuckDuckGo → developer's own website → scrapes tel: links + visible text
+      2. DuckDuckGo phone snippet search (finds numbers in search result snippets)
+      3. JustDial listing (last resort — often masked as 8888888888, filtered out)
 
     Returns {"phone": "...", "email": "...", "website": "...", "source": "..."}
     or {"phone": "", "email": "", "source": "not_found"}
     """
     result = {"phone": "", "email": "", "website": "", "source": "not_found"}
 
-    # Try developer's own website via Google
+    # Step 1: DuckDuckGo → official website → scrape tel: links + visible text
+    # Works well for large developers with their own website.
+    # Natural delay: time spent scraping the website separates the two DDG calls below.
     website = _google_find_website(developer_name, location)
     if website:
         result["website"] = website
         contact = _scrape_contact_page(website)
         if contact.get("phone"):
-            result.update(contact)
+            result["phone"] = contact["phone"]
             result["source"] = "website"
             logger.info("contact_found_website", developer=developer_name, phone=result["phone"])
-            return result
+        if contact.get("email"):
+            result["email"] = contact["email"]
 
-    # Try JustDial
-    jd_contact = _scrape_justdial(developer_name, location)
-    if jd_contact.get("phone"):
-        result.update(jd_contact)
-        result["source"] = "justdial"
-        logger.info("contact_found_justdial", developer=developer_name, phone=result["phone"])
-        return result
+    # Step 2: DuckDuckGo phone snippet search — only if step 1 had no phone.
+    # Works well for small developers listed in directories.
+    # The time spent on step 1 (website scraping) provides natural spacing between DDG requests.
+    if not result["phone"]:
+        ddg_contact = _scrape_indiamart(developer_name, location)
+        if ddg_contact.get("phone"):
+            result["phone"] = ddg_contact["phone"]
+            result["source"] = "ddg_snippet"
+            logger.info("contact_found_ddg_snippet", developer=developer_name, phone=result["phone"])
 
-    logger.info("contact_not_found", developer=developer_name)
+    # Step 3: JustDial — last resort (often returns masked 8888888888, filtered out)
+    if not result["phone"]:
+        jd_contact = _scrape_justdial(developer_name, location)
+        if jd_contact.get("phone"):
+            result["phone"] = jd_contact["phone"]
+            result["source"] = "justdial"
+            logger.info("contact_found_justdial", developer=developer_name, phone=result["phone"])
+
+    if not result["phone"]:
+        logger.info("contact_not_found", developer=developer_name)
+
     return result
 
 
 def _google_find_website(company_name: str, location: str) -> str:
-    """Search Google for the company's official website. Returns URL or ''."""
-    try:
-        query = f"{company_name} {location} real estate developer official website"
-        encoded = query.replace(" ", "+")
-        url = f"https://www.google.com/search?q={encoded}&num=5"
+    """
+    Find the company's official website.
+    Uses SerpAPI if SERPAPI_KEY is set (reliable Google results, no throttling).
+    Falls back to DuckDuckGo HTML scraping (free but throttles under load).
+    Returns URL or ''.
+    """
+    settings = get_settings()
+    query = f"{company_name} {location} real estate developer official website"
 
+    SKIP_DOMAINS = {"google", "youtube", "wikipedia", "magicbricks", "99acres",
+                    "housing", "makaan", "sulekha", "facebook", "linkedin",
+                    "justdial", "indiamart", "tradeindia", "commonfloor", "proptiger"}
+
+    # --- SerpAPI (preferred — real Google results, no throttling) ---
+    if settings.serpapi_key:
+        try:
+            resp = httpx.get(
+                settings.serpapi_url,
+                params={
+                    "q": query,
+                    "api_key": settings.serpapi_key,
+                    "engine": "google",
+                    "num": 5,
+                    "gl": "in",
+                    "hl": "en",
+                },
+                timeout=15,
+            )
+            for r in resp.json().get("organic_results", []):
+                site_url = r.get("link", "")
+                if not site_url.startswith("http"):
+                    continue
+                domain = re.sub(r'https?://(www\.)?', '', site_url).split('/')[0].lower()
+                if not any(skip in domain for skip in SKIP_DOMAINS):
+                    return site_url
+        except Exception as e:
+            logger.warning("serpapi_website_search_failed", company=company_name, error=str(e))
+
+    # --- DuckDuckGo HTML fallback (no key needed, may throttle under load) ---
+    try:
+        encoded = query.replace(" ", "+")
+        url = f"https://html.duckduckgo.com/html/?q={encoded}"
         resp = httpx.get(
             url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "en-IN,en;q=0.9",
+            },
             timeout=15,
             follow_redirects=True,
         )
         soup = BeautifulSoup(resp.text, "lxml")
-
-        # Extract organic result URLs — skip Google's own domains
-        SKIP_DOMAINS = {"google", "youtube", "wikipedia", "magicbricks", "99acres",
-                        "housing", "makaan", "sulekha", "facebook", "linkedin",
-                        "justdial", "indiamart", "tradeindia"}
-
-        for a in soup.select("a[href]"):
+        for a in soup.select("a.result__a"):
             href = a.get("href", "")
-            # Google wraps URLs in /url?q=
-            m = re.search(r'/url\?q=(https?://[^&]+)', href)
-            if m:
-                site_url = m.group(1)
-                domain = re.sub(r'https?://(www\.)?', '', site_url).split('/')[0].lower()
-                if not any(skip in domain for skip in SKIP_DOMAINS):
-                    return site_url
-
-        return ""
+            m = re.search(r'uddg=([^&]+)', href)
+            if not m:
+                continue
+            site_url = unquote(m.group(1))
+            if not site_url.startswith("http"):
+                continue
+            domain = re.sub(r'https?://(www\.)?', '', site_url).split('/')[0].lower()
+            if not any(skip in domain for skip in SKIP_DOMAINS):
+                return site_url
     except Exception as e:
-        logger.warning("google_website_search_failed", company=company_name, error=str(e))
-        return ""
+        logger.warning("duckduckgo_website_search_failed", company=company_name, error=str(e))
+
+    return ""
 
 
 def _scrape_contact_page(base_url: str) -> dict:
@@ -337,18 +389,31 @@ def _scrape_contact_page(base_url: str) -> dict:
                 timeout=15,
                 follow_redirects=True,
             )
-            text = BeautifulSoup(resp.text, "lxml").get_text()
+            soup = BeautifulSoup(resp.text, "lxml")
 
-            phones = INDIAN_PHONE.findall(text)
+            # Priority 1: extract from tel: href links (most reliable — explicitly marked as phone)
+            for a in soup.select("a[href^='tel:']"):
+                digits = re.sub(r'[^\d]', '', a["href"])
+                # Take last 10 digits — handles +91xxxxxxxxxx, 91xxxxxxxxxx, 0xxxxxxxxxx
+                clean = digits[-10:] if len(digits) >= 10 else digits
+                if re.match(r'[6-9]\d{9}$', clean):
+                    result["phone"] = clean
+                    break
+
+            # Priority 2: scan visible text for Indian phone patterns
+            if not result["phone"]:
+                text = soup.get_text()
+                for p in INDIAN_PHONE.findall(text):
+                    digits = re.sub(r'[^\d]', '', p)
+                    clean = digits[-10:] if len(digits) >= 10 else digits
+                    if re.match(r'[6-9]\d{9}$', clean):
+                        result["phone"] = clean
+                        break
+
+            # Extract email from visible text
+            text = soup.get_text()
             emails = EMAIL_RE.findall(text)
-
-            # Filter out generic/spam emails
             emails = [e for e in emails if not any(x in e.lower() for x in ["example", "test", "noreply", "support@"])]
-
-            if phones:
-                # Prefer mobile numbers (starting with 6-9, 10 digits)
-                mobile = next((p.replace(" ", "").replace("-", "") for p in phones if re.match(r'[6-9]\d{9}', p.replace(" ", "").replace("-", ""))), phones[0])
-                result["phone"] = mobile
             if emails:
                 result["email"] = emails[0]
 
@@ -359,6 +424,65 @@ def _scrape_contact_page(base_url: str) -> dict:
             continue
 
     return result
+
+
+def _scrape_indiamart(company_name: str, location: str = "Mumbai") -> dict:
+    """
+    Search for a phone number in search result snippets.
+    Uses SerpAPI if SERPAPI_KEY is set (reliable Google results, no throttling).
+    Falls back to DuckDuckGo HTML snippet search.
+    Returns {"phone": "", "email": ""}.
+    """
+    settings = get_settings()
+    city = location.split()[0]
+    query = f'"{company_name}" {city} phone contact'
+    INDIAN_PHONE = re.compile(r'[6-9]\d{9}')
+
+    # --- SerpAPI (preferred — real Google results, no throttling) ---
+    if settings.serpapi_key:
+        try:
+            resp = httpx.get(
+                settings.serpapi_url,
+                params={
+                    "q": query,
+                    "api_key": settings.serpapi_key,
+                    "engine": "google",
+                    "num": 5,
+                    "gl": "in",
+                    "hl": "en",
+                },
+                timeout=15,
+            )
+            for r in resp.json().get("organic_results", []):
+                # Check title and snippet for phone numbers
+                text = f"{r.get('title', '')} {r.get('snippet', '')}"
+                for p in INDIAN_PHONE.findall(text):
+                    if p != "8888888888":
+                        return {"phone": p, "email": ""}
+        except Exception as e:
+            logger.warning("serpapi_phone_search_failed", company=company_name, error=str(e))
+
+    # --- DuckDuckGo HTML fallback ---
+    try:
+        encoded = query.replace(" ", "+")
+        url = f"https://html.duckduckgo.com/html/?q={encoded}"
+        resp = httpx.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+                "Accept-Language": "en-IN,en;q=0.9",
+            },
+            timeout=15,
+            follow_redirects=True,
+        )
+        text = BeautifulSoup(resp.text, "lxml").get_text()
+        for p in INDIAN_PHONE.findall(text):
+            if p != "8888888888":
+                return {"phone": p, "email": ""}
+    except Exception as e:
+        logger.warning("ddg_phone_search_failed", company=company_name, error=str(e))
+
+    return {"phone": "", "email": ""}
 
 
 def _scrape_justdial(company_name: str, location: str) -> dict:
@@ -380,15 +504,14 @@ def _scrape_justdial(company_name: str, location: str) -> dict:
         text = BeautifulSoup(resp.text, "lxml").get_text()
 
         INDIAN_PHONE = re.compile(r'(?:\+91[\s\-]?)?[6-9]\d{9}')
-        phones = INDIAN_PHONE.findall(text)
+        raw_phones = INDIAN_PHONE.findall(text)
 
-        if phones:
-            mobile = next(
-                (p.replace(" ", "").replace("-", "") for p in phones
-                 if re.match(r'[6-9]\d{9}', p.replace(" ", "").replace("-", ""))),
-                phones[0]
-            )
-            return {"phone": mobile, "email": ""}
+        # Clean and filter — drop masked numbers (8888888888) returned by JustDial
+        for p in raw_phones:
+            digits = re.sub(r'[^\d]', '', p)
+            clean = digits[-10:] if len(digits) >= 10 else digits
+            if re.match(r'[6-9]\d{9}$', clean) and clean != "8888888888":
+                return {"phone": clean, "email": ""}
 
     except Exception as e:
         logger.warning("justdial_scrape_failed", company=company_name, error=str(e))

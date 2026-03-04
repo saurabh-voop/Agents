@@ -81,16 +81,16 @@ class AgentS:
         # Collect raw signals from all sources in parallel concept (sequential here)
         raw_leads = []
 
-        # Source 1: Google News RSS
+        # Source 1: Google News RSS — use "Mumbai" not the district name (RSS works on city, not suburb)
         news_articles = fetch_google_news(
-            query=f"construction project {self.location_filter} OR DG set OR diesel generator OR power backup {self.location_filter}"
+            query="construction project Mumbai OR DG set OR diesel generator OR power backup Mumbai"
         )
         if news_articles:
             news_leads = self._extract_leads_from_news(news_articles)
             raw_leads.extend(news_leads)
 
         # Source 2: MahaRERA — all 4 Greater Mumbai districts, Jan 2024 to today
-        rera_projects = fetch_maharera_projects(districts=[self.location_filter])
+        rera_projects = fetch_maharera_projects(districts=MUMBAI_DISTRICTS)
         if rera_projects:
             rera_leads = self._extract_leads_from_rera(rera_projects)
             raw_leads.extend(rera_leads)

@@ -129,8 +129,8 @@ class AgentS:
             lead_id = self._save_lead(lead)
             results["qualified"] += 1
 
-            # F5: OUTREACH (if has contact and score >= 40)
-            if lead.get("phone") and lead.get("lead_score", 0) >= 40:
+            # F5: OUTREACH (score >= 25 with at least one contact channel)
+            if lead.get("lead_score", 0) >= 25 and (lead.get("phone") or lead.get("email")):
                 self._send_outreach(lead, lead_id)
                 results["outreach_sent"] += 1
 
@@ -462,7 +462,7 @@ NEVER mention price. No emojis."""
                             to_email=email,
                             to_name=lead.get("contact_name") or lead.get("company_name", ""),
                             subject=subject,
-                            body=body.strip(),
+                            body_html=body.strip(),
                         )
                         log_activity(
                             agent=self.agent_id, action="outreach_sent",
@@ -727,7 +727,7 @@ Under 80 words. No emojis. Professional."""
                     lead_id = self._save_lead(lead_data)
 
                     outreach_sent = False
-                    if lead_data.get("phone") and lead_data.get("lead_score", 0) >= 40:
+                    if lead_data.get("lead_score", 0) >= 25 and (lead_data.get("phone") or lead_data.get("email")):
                         self._send_outreach(lead_data, lead_id)
                         outreach_sent = True
 
